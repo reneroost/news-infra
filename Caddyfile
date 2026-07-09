@@ -3,7 +3,10 @@
 	# Fails closed: nothing is cached unless a Spring Boot handler sets Cache-Control itself.
 	cache {
 		ttl 1h                          # fallback only, if upstream sends Cache-Control with no max-age
-		stale 1h                        # serve stale while revalidating, matching the hourly scrape cycle
+		stale 1h                        # serve-stale-while-revalidate. Spring aligns every hourly max-age to
+		                                # the same :15 refresh boundary, so all keys expire at once — this
+		                                # absorbs that synchronized expiry (one bg revalidation per key
+		                                # instead of a thundering herd on Postgres at :15 each hour).
 		default_cache_control no-store  # opt-in caching: no header from Spring => never cached
 	}
 }

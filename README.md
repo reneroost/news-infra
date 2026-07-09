@@ -50,6 +50,15 @@ in-memory storage) rather than the stock package binary. Caching is fail-closed:
 nothing is cached unless the upstream Spring Boot handler explicitly sets
 `Cache-Control`. See `news-backend`'s docs for which endpoints opt in.
 
+Cache TTLs are **boundary-aligned**: the backend sets each cacheable response's
+`max-age` to expire at the hourly data-refresh boundary (~:15, once the scraper
+and scoring jobs have settled), not a rolling hour from when it was cached. A
+side effect is that every key expires at the *same instant*, which makes the
+global `stale 1h` directive load-bearing — it serves stale-while-revalidate so
+that synchronized expiry becomes one background revalidation per key rather than
+a thundering herd on Postgres at :15 each hour. Don't drop `stale` for
+"freshness" without accounting for that.
+
 **Operational note:** because this is a manually-swapped custom binary, a
 routine `dnf update` on the host will silently reinstall the stock Caddy
 package and drop the cache module (fails safe — caching just stops, nothing
