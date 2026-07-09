@@ -1,0 +1,13 @@
+# Secrets — never tracked
+*.env
+.env
+.*-password
+*-password
+*.pem
+*.key
+id_*
+id_*.pub
+
+# Caddy runtime state (lives elsewhere, but excluded defensively)
+autosave.json
+*.bak

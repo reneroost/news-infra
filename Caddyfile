@@ -1,0 +1,94 @@
+{
+	# Souin HTTP cache (RFC 7234), in-memory storage — fine for a single VPS instance.
+	# Fails closed: nothing is cached unless a Spring Boot handler sets Cache-Control itself.
+	cache {
+		ttl 1h                          # fallback only, if upstream sends Cache-Control with no max-age
+		stale 1h                        # serve stale while revalidating, matching the hourly scrape cycle
+		default_cache_control no-store  # opt-in caching: no header from Spring => never cached
+	}
+}
+
+(deny_bots) {
+	handle /robots.txt {
+		header Content-Type "text/plain; charset=utf-8"
+		respond `User-agent: *
+Disallow: /`
+	}
+}
+
+# ------------------------------------------------------------------------------
+# Public API Domain
+# ------------------------------------------------------------------------------
+backend.mostreadnews.com {
+	import deny_bots
+
+	# Structural Guardrail: Enforce both GET method AND valid edge secret
+	@read_only_authorized {
+		method GET
+		header X-Backend-Secret {env.BACKEND_SECRET}
+	}
+
+	handle @read_only_authorized {
+		cache
+		reverse_proxy localhost:8080 {
+			# Strip secret header before passing to Spring Boot
+			header_up -X-Backend-Secret
+		}
+	}
+
+	# Fallback: Safe 403 for any non-GET method or missing token
+	respond 403
+}
+
+# ------------------------------------------------------------------------------
+# Private Management & Monitoring Domain (Backend Only)
+# ------------------------------------------------------------------------------
+diagnostics.mostreadnews.com {
+	import deny_bots
+	basic_auth {
+		import /etc/caddy/.monitor-password
+	}
+	rewrite * /diagnostics{path}
+	reverse_proxy localhost:8080 {
+		header_up -Authorization
+	}
+}
+
+# ------------------------------------------------------------------------------
+# Production Scraper
+# ------------------------------------------------------------------------------
+scraper.mostreadnews.com {
+	import deny_bots
+	basic_auth {
+		import /etc/caddy/.monitor-password
+	}
+	reverse_proxy localhost:8081 {
+		header_up -Authorization
+	}
+}
+
+# ------------------------------------------------------------------------------
+# Staging Scraper
+# ------------------------------------------------------------------------------
+testscraper.mostreadnews.com {
+	import deny_bots
+	basic_auth {
+		import /etc/caddy/.monitor-password
+	}
+	reverse_proxy localhost:8086 {
+		header_up -Authorization
+	}
+}
+
+# ------------------------------------------------------------------------------
+# Miscellaneous Internal Apps
+# ------------------------------------------------------------------------------
+my-bookmarks.mostreadnews.com {
+	import deny_bots
+	basic_auth {
+		import /etc/caddy/.my-bookmarks-password
+	}
+	reverse_proxy localhost:8089 {
+		header_up -Authorization
+	}
+}
