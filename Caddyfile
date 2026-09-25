@@ -1,17 +1,45 @@
+# Production edge for mostreadnews.com. Every site below is reached through Cloudflare, and every
+# upstream is bound to loopback on this host. Needs the custom build in README.md: a stock Caddy
+# rejects the `cache` block and does not start.
 {
-	# Souin HTTP cache (RFC 7234), in-memory storage — fine for a single VPS instance.
-	# Fails closed: nothing is cached unless a Spring Boot handler sets Cache-Control itself.
+	# The admin API is a Unix socket in the caddy user's own 0750 home instead of TCP
+	# 127.0.0.1:2019, where any local process could load a new configuration without auth,
+	# including one without the secret or password checks below. `systemctl reload caddy` still
+	# works: `caddy reload` reads the admin address from the file it is loading.
+	admin unix//var/lib/caddy/admin.sock
+
+	# Souin HTTP cache (RFC 7234). Fails closed: nothing is stored unless the upstream handler
+	# sends Cache-Control itself.
 	cache {
-		ttl 1h                          # fallback only, if upstream sends Cache-Control with no max-age
-		stale 1h                        # serve-stale-while-revalidate. Spring aligns every hourly max-age to
-		                                # the same :15 refresh boundary, so all keys expire at once — this
-		                                # absorbs that synchronized expiry (one bg revalidation per key
-		                                # instead of a thundering herd on Postgres at :15 each hour).
-		default_cache_control no-store  # opt-in caching: no header from Spring => never cached
+		# Fallback only, for an upstream Cache-Control with no max-age.
+		ttl 1h
+
+		# Serve stale while revalidating. The backend aligns every hourly max-age to the same
+		# :15 refresh boundary, so all keys expire together; this turns that into one background
+		# revalidation per key instead of a thundering herd on Postgres at :15 each hour.
+		stale 1h
+
+		# Opt-in caching: a response without Cache-Control is never stored.
+		default_cache_control no-store
+
+		# Bounded storage. Without a storage module Souin uses an unbounded map that never evicts:
+		# every distinct URL, whose raw query string is part of the key, would stay in memory until
+		# Caddy restarts. Otter caps the entry count and evicts expired and least-used entries.
+		# Each cached response takes two entries (key mapping plus body), so 10000 is about 5000
+		# responses; at 8-25 KB compressed per feed that is at most ~100-250 MB.
+		otter {
+			configuration {
+				size 10000
+			}
+		}
 	}
 }
 
-(deny_bots) {
+# No site here is for search engines. This only reaches a crawler where auth and rewrites live
+# inside `handle` blocks: Caddy orders directives by type, not by position, so a site-level
+# `basic_auth` or `rewrite` runs first. That is why the operator sites answered robots.txt with
+# 401 until 2026-09-25.
+(robots) {
 	handle /robots.txt {
 		header Content-Type "text/plain; charset=utf-8"
 		respond `User-agent: *
@@ -19,79 +47,73 @@ Disallow: /`
 	}
 }
 
+# An operator-only service: basic auth, then the upstream, with the credential stripped so the
+# app never sees it. Arguments: the password file, then the upstream address.
+(operator) {
+	import robots
+	handle {
+		basic_auth {
+			import {args[0]}
+		}
+		reverse_proxy {args[1]} {
+			header_up -Authorization
+		}
+	}
+}
+
 # ------------------------------------------------------------------------------
-# Public API Domain
+# Public API, reached only through the frontend's Cloudflare Worker
 # ------------------------------------------------------------------------------
 backend.mostreadnews.com {
-	import deny_bots
+	import robots
 
-	# Structural Guardrail: Enforce both GET method AND valid edge secret
-	@read_only_authorized {
+	# GET only, /api/v1 only, and only with the edge secret. The operator routes the same app
+	# serves under /diagnostics are not reachable here even with the secret; they have their
+	# own vhost below.
+	@public_read {
 		method GET
+		path /api/v1/*
 		header X-Backend-Secret {env.BACKEND_SECRET}
+		# Fail closed if BACKEND_SECRET is ever empty or unset: the matcher above would then
+		# accept a request carrying an empty X-Backend-Secret header.
+		not header X-Backend-Secret ""
 	}
 
-	handle @read_only_authorized {
+	handle @public_read {
 		cache
-		reverse_proxy localhost:8080 {
-			# Strip secret header before passing to Spring Boot
+		reverse_proxy 127.0.0.1:8080 {
 			header_up -X-Backend-Secret
 		}
 	}
 
-	# Fallback: Safe 403 for any non-GET method or missing token
-	respond 403
+	handle {
+		respond 403
+	}
 }
 
 # ------------------------------------------------------------------------------
-# Private Management & Monitoring Domain (Backend Only)
+# Operator surfaces, behind basic auth
 # ------------------------------------------------------------------------------
+
+# news-backend's operator routes. The vhost's paths are the app's /diagnostics/** routes without
+# that prefix. robots.txt is exempt so that it is answered by the snippet, not rewritten away.
 diagnostics.mostreadnews.com {
-	import deny_bots
-	basic_auth {
-		import /etc/caddy/.monitor-password
-	}
-	rewrite * /diagnostics{path}
-	reverse_proxy localhost:8080 {
-		header_up -Authorization
-	}
+	@app not path /robots.txt
+	rewrite @app /diagnostics{path}
+	import operator /etc/caddy/.monitor-password 127.0.0.1:8080
 }
 
-# ------------------------------------------------------------------------------
-# Production Scraper
-# ------------------------------------------------------------------------------
+# Production scraper.
 scraper.mostreadnews.com {
-	import deny_bots
-	basic_auth {
-		import /etc/caddy/.monitor-password
-	}
-	reverse_proxy localhost:8081 {
-		header_up -Authorization
-	}
+	import operator /etc/caddy/.monitor-password 127.0.0.1:8081
 }
 
-# ------------------------------------------------------------------------------
-# Staging Scraper
-# ------------------------------------------------------------------------------
+# Staging scraper.
 testscraper.mostreadnews.com {
-	import deny_bots
-	basic_auth {
-		import /etc/caddy/.monitor-password
-	}
-	reverse_proxy localhost:8086 {
-		header_up -Authorization
-	}
+	import operator /etc/caddy/.monitor-password 127.0.0.1:8086
 }
 
-# ------------------------------------------------------------------------------
-# Miscellaneous Internal Apps
-# ------------------------------------------------------------------------------
+# Miscellaneous internal app.
 my-bookmarks.mostreadnews.com {
-	import deny_bots
-	basic_auth {
-		import /etc/caddy/.my-bookmarks-password
-	}
-	reverse_proxy localhost:8089 {
-		header_up -Authorization
-	}
+	import operator /etc/caddy/.my-bookmarks-password 127.0.0.1:8089
 }
