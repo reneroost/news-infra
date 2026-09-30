@@ -1,0 +1,172 @@
+From 24b38e5b15cf9ba1efb7ba4eb0aa3133085edf09 Mon Sep 17 00:00:00 2001
+From: Rene Roost <roost.rene@gmail.com>
+Date: Wed, 30 Sep 2026 10:36:51 +0300
+Subject: [PATCH] fix(middleware): don't return while upstream holds the live
+ header map
+
+When the request context ends, ServeHTTP returned at once while the
+Upstream goroutine kept running. That goroutine can hold the live
+response header map: CustomWriter.Header() hands out rw.Header() while
+the context is still live, and a caller such as a reverse proxy keeps
+the map and writes into it later. After ServeHTTP returns, the server
+iterates the same map to write the status (Caddy's error path, then
+net/http's HTTP/2 cloneHeader), and a concurrent map write there is a
+fatal error rather than a recoverable panic. It took a Caddy
+2.11.4 + cache-handler v0.17.0 process down in production:
+
+  fatal error: concurrent map iteration and map write
+  net/http/internal/http2.cloneHeader
+  net/http/internal/http2.(*responseWriterState).writeHeader
+  caddyhttp.(*Server).ServeHTTP  (modules/caddyhttp/server.go:468)
+
+Wait for the goroutine before touching the writer or returning, on
+both the Canceled and DeadlineExceeded branches. Upstream observes the
+same context, so the wait is short. The buffer ownership handoff is
+kept unchanged.
+
+The new tests fail on v1.7.9 (deterministically, and -race reports the
+race; the Canceled test reproduces the fatal error itself) and pass
+with this change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/middleware/live_writer_test.go | 109 +++++++++++++++++++++++++++++
+ pkg/middleware/middleware.go       |   6 ++
+ 2 files changed, 115 insertions(+)
+ create mode 100644 pkg/middleware/live_writer_test.go
+
+diff --git a/pkg/middleware/live_writer_test.go b/pkg/middleware/live_writer_test.go
+new file mode 100644
+index 00000000..9653e96c
+--- /dev/null
++++ b/pkg/middleware/live_writer_test.go
+@@ -0,0 +1,109 @@
++package middleware
++
++import (
++	baseCtx "context"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// headerWritingUpstream obtains the response header map while the request is
++// still live, then keeps writing into that map for a while after the request
++// context ends. A reverse proxy copying upstream headers does the same thing:
++// it takes w.Header() once and loops over it, and a client disconnect can land
++// in the middle of the loop.
++func headerWritingUpstream(started chan<- struct{}, finished *atomic.Bool) handlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) error {
++		h := w.Header()
++		close(started)
++
++		<-r.Context().Done()
++		for i := 0; i < 200; i++ {
++			h.Set("X-Upstream-"+strconv.Itoa(i%8), strconv.Itoa(i))
++			time.Sleep(50 * time.Microsecond)
++		}
++		finished.Store(true)
++
++		return r.Context().Err()
++	}
++}
++
++// iterateLikeTheServer does what an HTTP server does with the header map once
++// the handler has returned: it ranges over it to serialise the response head.
++func iterateLikeTheServer(h http.Header) {
++	for i := 0; i < 200; i++ {
++		for k, v := range h {
++			_, _ = k, v
++		}
++		time.Sleep(50 * time.Microsecond)
++	}
++}
++
++// TestCancelledRequestDoesNotReturnWhileUpstreamHoldsTheWriter reproduces a
++// production crash: "fatal error: concurrent map iteration and map write" in
++// net/http's HTTP/2 cloneHeader, reached from Caddy's error path writing the
++// status for a request whose client had disconnected. ServeHTTP returned
++// context.Canceled while the upstream goroutine could still write into the
++// live header map, so the server's iteration raced that write.
++//
++// The assertion is deterministic; run with -race to also see the data race.
++func TestCancelledRequestDoesNotReturnWhileUpstreamHoldsTheWriter(t *testing.T) {
++	handler, _ := newTestHandler(t)
++
++	started := make(chan struct{})
++	var finished atomic.Bool
++
++	ctx, cancel := baseCtx.WithCancel(baseCtx.Background())
++	req := httptest.NewRequest(http.MethodGet, "http://example.com/cancel-live-writer", nil).WithContext(ctx)
++	rec := httptest.NewRecorder()
++
++	errCh := make(chan error, 1)
++	go func() {
++		errCh <- handler.ServeHTTP(rec, req, headerWritingUpstream(started, &finished))
++	}()
++
++	<-started
++	cancel()
++	err := <-errCh
++
++	if !finished.Load() {
++		t.Error("ServeHTTP returned while the upstream goroutine could still write the response headers")
++	}
++	if err != baseCtx.Canceled {
++		t.Errorf("want context.Canceled, got %v", err)
++	}
++
++	iterateLikeTheServer(rec.Header())
++}
++
++// TestBackendTimeoutDoesNotReturnWhileUpstreamHoldsTheWriter is the same race
++// on the other branch of the same select: the backend timeout writes a 504
++// straight to the live writer while the upstream goroutine is still running.
++func TestBackendTimeoutDoesNotReturnWhileUpstreamHoldsTheWriter(t *testing.T) {
++	cfg := newTestConfig()
++	cfg.DefaultCache.Timeout.Backend.Duration = 20 * time.Millisecond
++	handler := NewHTTPCacheHandler(cfg)
++
++	started := make(chan struct{})
++	var finished atomic.Bool
++
++	req := httptest.NewRequest(http.MethodGet, "http://example.com/timeout-live-writer", nil)
++	rec := httptest.NewRecorder()
++
++	err := handler.ServeHTTP(rec, req, headerWritingUpstream(started, &finished))
++
++	if !finished.Load() {
++		t.Error("ServeHTTP returned while the upstream goroutine could still write the response headers")
++	}
++	if err != baseCtx.DeadlineExceeded {
++		t.Errorf("want context.DeadlineExceeded, got %v", err)
++	}
++	if rec.Code != http.StatusGatewayTimeout {
++		t.Errorf("want 504, got %d", rec.Code)
++	}
++
++	iterateLikeTheServer(rec.Header())
++}
+diff --git a/pkg/middleware/middleware.go b/pkg/middleware/middleware.go
+index 6a4f4619..c1f0973a 100644
+--- a/pkg/middleware/middleware.go
++++ b/pkg/middleware/middleware.go
+@@ -1249,6 +1249,12 @@ func (s *SouinBaseHandler) ServeHTTP(rw http.ResponseWriter, rq *http.Request, n
+ 		// Transfer buffer ownership to the goroutine so it can return the
+ 		// buffer to the pool once Upstream finishes.
+ 		bufPoolOwned.Store(false)
++		// The goroutine may still hold the live response header map, which
++		// customWriter.Header() handed out before the context ended. Once
++		// ServeHTTP returns, the server iterates that map to write the status,
++		// and a concurrent write is a fatal error, not a recoverable panic.
++		// Upstream observes the same context, so this wait is short.
++		<-errorCacheCh
+ 		switch req.Context().Err() {
+ 		case baseCtx.DeadlineExceeded:
+ 			rw.Header().Set("Cache-Status", cacheName+"; fwd=bypass; detail=DEADLINE-EXCEEDED")
+-- 
+2.53.0
+

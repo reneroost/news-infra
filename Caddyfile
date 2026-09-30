@@ -22,6 +22,14 @@
 		# Opt-in caching: a response without Cache-Control is never stored.
 		default_cache_control no-store
 
+		# Surrogate keys index cache entries by tag for Souin's purge API, which nothing here
+		# uses: the backend sends no Surrogate-Key header and nothing purges. Left on, every stored
+		# response appends its key to one comma-joined string under a global mutex (the Otter
+		# module has no native sets), a string that is never trimmed when Otter evicts the entry.
+		# Its memory grows with every distinct URL ever cached, the size cap below does not bound
+		# it, and each insert costs time in proportion to what came before.
+		disable_surrogate_key
+
 		# Bounded storage. Without a storage module Souin uses an unbounded map that never evicts:
 		# every distinct URL, whose raw query string is part of the key, would stay in memory until
 		# Caddy restarts. Otter caps the entry count and evicts expired and least-used entries.

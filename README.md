@@ -12,6 +12,10 @@ own repositories.
   `/etc/caddy/Caddyfile`.
 - **`backend.env.example`** — the shape of the real `backend.env` (git-ignored,
   lives only on the host). Copy it to `backend.env` and fill in a real value.
+- **`systemd/caddy.service.d/override.conf`** — the unit drop-in, live at
+  `/etc/systemd/system/caddy.service.d/`. See [Crash resilience](#crash-resilience).
+- **`patches/`** — source patches the custom build applies. See
+  [The Souin patch](#the-souin-patch).
 
 ## What this repo does *not* contain
 
@@ -66,6 +70,26 @@ caller appends) was held for the life of the process, on a host with no swap.
 Otter caps the store at `size` entries (two per cached response) and evicts
 expired and least-used entries first.
 
+**That cap bounds the cache and nothing beside it, so surrogate keys are off.**
+Souin also indexes every stored response by surrogate-key tag, for its purge API.
+The backend sends no `Surrogate-Key` header, so every response lands in one
+global tag plus one per path, and with a storage that has no native sets (Otter
+has none) each tag is a single comma-joined string: every store reads it, scans
+it, appends one key and writes it back, under one global mutex. Evicting the
+entry does not remove its key, and every append renews the tag's TTL, so the
+string grows with every distinct URL ever cached. Measured locally on
+2026-09-30 with the production binary caching unique URLs: 18,834 goroutines
+queued on that mutex and 1.3 GB within seconds, still growing after the load
+stopped, against ~200 MB and ~85 goroutines with `disable_surrogate_key`.
+Nothing here purges by tag, so the index had no consumer. Re-enable it only
+together with a storage that implements `core.SetStorer`.
+
+**Souin has its own upstream timeout, 10 s by default** (`timeout.backend`, not
+set here). A request past it gets Souin's `504` with the body
+`Internal server error`, whatever the backend would have answered. A cold
+category feed took 7.4 s on 2026-09-30, so that ceiling is closer than it looks;
+raise it in the `cache` block before a slow endpoint meets it, not after.
+
 Cache TTLs are **boundary-aligned**: the backend sets each cacheable response's
 `max-age` to expire at the hourly data-refresh boundary (~:15, once the scraper
 and scoring jobs have settled), not a rolling hour from when it was cached. A
@@ -94,6 +118,50 @@ echo 'exclude=caddy' | sudo tee -a /etc/dnf/dnf.conf
 
 and bump Caddy only by rebuilding, as below.
 
+## Crash resilience
+
+On 2026-09-30 at 01:41 UTC Caddy exited with a Go runtime
+`fatal error: concurrent map iteration and map write` and stayed down for almost
+three hours: the unit had `Restart=no`, and a fatal error, unlike a panic, cannot
+be recovered inside the process. The cause was a Souin bug, now patched in the
+build (see [The Souin patch](#the-souin-patch)). The unit no longer depends on
+that being the last one.
+
+`systemd/caddy.service.d/override.conf` is the drop-in, live at
+`/etc/systemd/system/caddy.service.d/override.conf`:
+
+- **`Restart=on-failure` with no start limit.** The default limit (5 starts per
+  interval) turns a crash that can be triggered from outside into a unit that
+  stays stopped once it is triggered five times. A binary or Caddyfile that
+  cannot start (the `dnf update` case above) now retries every 15 seconds
+  instead, which costs nothing. The delay backs off 2 s → 4 s → 8 s → 15 s and
+  stays at 15 s until the next manual start resets the count.
+- **`GOTRACEBACK=all`.** A concurrent-map fatal error prints only the goroutine
+  that detected it. `all` prints every goroutine, including the one that caused
+  it, which is what an upstream report needs.
+
+Install or update it:
+
+```bash
+scp systemd/caddy.service.d/override.conf hetzner-news:caddy-override.conf
+ssh -t hetzner-news 'sudo install -m 0644 ~/caddy-override.conf /etc/systemd/system/caddy.service.d/override.conf && sudo systemctl daemon-reload && rm ~/caddy-override.conf'
+```
+
+`daemon-reload` applies the restart policy to the running process; the
+environment variable only reaches the next start.
+
+**An automatic restart hides the outage, not the crash.** Each one leaves the
+full trace in the journal, and systemd counts them:
+
+```bash
+systemctl show caddy -p NRestarts               # since the last manual start
+journalctl -u caddy | grep -E 'fatal error|panic:|Scheduled restart job'
+```
+
+The journal is persistent since 2026-09-30 (`/var/log/journal`). Before that it
+lived in `/run`, capped at about 70 MB: roughly five days of history, lost on
+every reboot, which is why nothing earlier than 2026-09-25 survives.
+
 ## The admin API
 
 The admin API listens on the Unix socket `/var/lib/caddy/admin.sock`, not on TCP
@@ -117,6 +185,7 @@ Pinned so the build is reproducible. Latest of each as of 2026-09-25:
 |---|---|---|
 | Caddy | v2.11.4 | latest release |
 | `caddyserver/cache-handler` | v0.17.0 | brings Souin v1.7.9 and `storages/core` v0.0.20 |
+| `darkweak/souin` | v1.7.9 **+ `patches/`** | replaced with a patched checkout, see below |
 | `darkweak/storages/otter/caddy` | v0.0.20 | resolves `storages/otter` v0.0.19, identical code to v0.0.20 |
 | Go | 1.27.1 | |
 | xcaddy | v0.4.7 | |
@@ -140,12 +209,46 @@ tar -xzf go1.27.1.linux-amd64.tar.gz && rm go1.27.1.linux-amd64.tar.gz
 export GOROOT=$PWD/go GOPATH=$PWD/gopath GOCACHE=$PWD/gocache CGO_ENABLED=0 GOFLAGS=-p=4
 export PATH=$GOROOT/bin:$GOPATH/bin:$PATH
 go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
+
+# Souin v1.7.9 with the patch applied (path to this repo's patches/ directory):
+git clone -q --branch v1.7.9 https://github.com/darkweak/souin souin
+git -C souin am <news-infra>/patches/souin-v1.7.9-wait-for-upstream-on-cancel.patch
+(cd souin && go test -race -count=1 ./pkg/middleware/)
+
 xcaddy build v2.11.4 \
   --with github.com/caddyserver/cache-handler@v0.17.0 \
   --with github.com/darkweak/storages/otter/caddy@v0.0.20 \
+  --replace github.com/darkweak/souin=$PWD/souin \
   --output ./caddy
 ./caddy list-modules --versions | grep -E 'cache|otter'   # expect cache v0.17.0, storages.cache.otter v0.0.20
+./caddy build-info | grep -A1 'darkweak/souin'            # expect the `=> .../souin (devel)` replace line
 ```
+
+Compare `build-info` with the running binary's before swapping: the only
+differences should be the Souin line and its `=>` replace.
+
+### The Souin patch
+
+`patches/souin-v1.7.9-wait-for-upstream-on-cancel.patch` fixes the crash in
+[Crash resilience](#crash-resilience). Souin runs each cache miss's upstream
+request in a goroutine and returns as soon as the request context ends, whether
+the client disconnected or Souin's own backend timeout fired. It returns while
+that goroutine may still hold the live response header map, which
+`CustomWriter.Header()` handed out before the context ended. Caddy then writes
+the error status, which iterates the same map, and `reverse_proxy` copying the
+upstream's headers into it is a concurrent map write. That is a fatal error for
+the whole process. With the patch, `ServeHTTP` waits for the goroutine first; it
+observes the same context, so the wait is short.
+
+This is not a timing rarity. Through the frontend Worker any reader can cancel
+requests, and the unpatched binary fell over within about a second under a local
+HTTP/2 stress run that aborted requests around the moment the upstream answered.
+The patched build ran 750,000 such requests, including 94,000 cancellations,
+flat at ~200 MB. The patch carries two regression tests, and without the fix the
+first reproduces the production fatal error itself.
+
+**Drop the patch** once a Souin release contains an equivalent fix: then build
+without `--replace`, and delete the file.
 
 ## Swapping the binary in
 
