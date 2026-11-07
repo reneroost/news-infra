@@ -324,8 +324,24 @@ There's no CI/CD here — this is a single Caddyfile on a single host. The flow 
 
 ## Secrets rotation
 
-If either `BACKEND_SECRET` or a `basic_auth` credential is ever rotated
-(recommended periodically, and any time a compromise is suspected — see
-`news-backend`'s `SECURITY.md` residual-risks section): update the relevant
-file on the host and the corresponding value in the Cloudflare Worker/dashboard.
-No change is needed in this repo, since neither value is tracked here.
+Rotate `BACKEND_SECRET` periodically, and any time a compromise is suspected
+(see `news-backend`'s `SECURITY.md` residual-risks section). The Caddyfile
+accepts a second value from `BACKEND_SECRET_NEXT`, so the edge and the frontend
+never have to switch at the same instant:
+
+1. Generate a value on your own machine: `openssl rand -hex 32`. Keep it
+   alphanumeric, because the header matcher reads a leading or trailing `*` as
+   a wildcard.
+2. Set `BACKEND_SECRET_NEXT=<new>` in `/etc/caddy/backend.env` and **restart**
+   Caddy. A reload is not enough: `{env.*}` placeholders read the running
+   process's environment, which only a restart re-reads. A restart also empties
+   the Souin cache, so do it at XX:20–XX:50 UTC.
+3. Put the new value in every frontend copy and deploy: the Pages production
+   secret `BACKEND_SECRET`, the GitHub Actions repository secret
+   `BACKEND_SECRET`, and the local `.dev.vars`. A Pages secret reaches the
+   Worker only with the next deployment.
+4. Set `BACKEND_SECRET=<new>`, empty `BACKEND_SECRET_NEXT`, restart Caddy
+   again. A straggler still sending the old value now gets `403`.
+
+For a `basic_auth` credential, update the password file on the host. Neither
+value is tracked in this repo.

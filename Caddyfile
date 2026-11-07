@@ -8,6 +8,19 @@
 	# works: `caddy reload` reads the admin address from the file it is loading.
 	admin unix//var/lib/caddy/admin.sock
 
+	# Error log lines carry the incoming request headers, and Caddy only redacts its own
+	# credential headers (Authorization, Cookie). Without this, every logged error on the backend
+	# site wrote the edge secret into the journal in plain text, as it did until 2026-11-07.
+	log default {
+		output stderr
+		format filter {
+			wrap json
+			fields {
+				request>headers>X-Backend-Secret delete
+			}
+		}
+	}
+
 	# Souin HTTP cache (RFC 7234). Fails closed: nothing is stored unless the upstream handler
 	# sends Cache-Control itself.
 	cache {
@@ -82,6 +95,10 @@ backend.mostreadnews.com {
 		method GET
 		path /api/v1/*
 		header X-Backend-Secret {env.BACKEND_SECRET}
+		# The rotation slot: values listed for one header field are alternatives, so a second
+		# secret is accepted while this is set. Leave it empty outside a rotation; an empty value
+		# admits only an empty header, which the next line refuses.
+		header X-Backend-Secret {env.BACKEND_SECRET_NEXT}
 		# Fail closed if BACKEND_SECRET is ever empty or unset: the matcher above would then
 		# accept a request carrying an empty X-Backend-Secret header.
 		not header X-Backend-Secret ""
