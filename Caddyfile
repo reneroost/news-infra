@@ -133,11 +133,6 @@ scraper.mostreadnews.com {
 	import operator /etc/caddy/.monitor-password 127.0.0.1:8081
 }
 
-# Staging scraper.
-testscraper.mostreadnews.com {
-	import operator /etc/caddy/.monitor-password 127.0.0.1:8086
-}
-
 # Miscellaneous internal app.
 my-bookmarks.mostreadnews.com {
 	import operator /etc/caddy/.my-bookmarks-password 127.0.0.1:8089

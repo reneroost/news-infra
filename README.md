@@ -38,7 +38,7 @@ Browser ── same-origin /api/v1/* ──► Cloudflare Worker (frontend repo)
                                         ▼
                               news-backend on 127.0.0.1:8080 (loopback-bound)
 
-Operator ── basic_auth ──► diagnostics / scraper / testscraper / my-bookmarks
+Operator ── basic_auth ──► diagnostics / scraper / my-bookmarks
                                         ▼
                               respective services on 127.0.0.1, credential stripped
 ```
@@ -109,7 +109,7 @@ remaining benefit too small to take on that constraint.
 overwrites the one the `caddy` RPM owns, so a routine `dnf update` reinstalls the
 stock binary, and a stock Caddy **rejects this Caddyfile outright**
 (`unrecognized global option: cache`, verified 2026-09-25). On the next restart
-Caddy does not come up, and all five domains go down with it. This is not a
+Caddy does not come up, and all four domains go down with it. This is not a
 fail-safe loss of caching. Keep the package out of updates:
 
 ```bash
@@ -253,7 +253,7 @@ without `--replace`, and delete the file.
 ## Swapping the binary in
 
 A new binary needs a `restart`, not a `reload`. That empties the in-memory cache
-and briefly drops all five domains, so do it inside the backend's deploy window
+and briefly drops all four domains, so do it inside the backend's deploy window
 (XX:15–XX:50) and not while a backend deploy is running: its drain step calls
 `diagnostics.mostreadnews.com`.
 
